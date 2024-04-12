@@ -27,9 +27,9 @@ RES="\033[0m"
 # --------------------------- functions -----------------------------------
 
 # etc conf
-function etc_cnf(){
-    item=$1
-    section="CNF"
+function get_etc(){
+    section=$1
+    item=$2
     cnf_file="./custom.cnf"
     if [ ! -f "$cnf_file" ]; then
         return 0
@@ -37,6 +37,14 @@ function etc_cnf(){
     cnf_options=`awk -F '=' '/'$section'/{a=1}a==1&&$1~/'${item}'/{print $2;exit}' ${cnf_file}`
     cnf_options=${cnf_options//\"/}
     echo ${cnf_options}
+}
+
+function etc_ca(){
+    get_etc 'CA' $1
+}
+
+function etc_cnf(){
+    get_etc 'CNF' $1
 }
 
 # san.conf file init
@@ -98,6 +106,7 @@ EOF
 # --------------------------- task exec -----------------------------------
 
 # wildcard doamin name
+CA_DOMAIN_NAME=$(etc_ca "DOMAIN_NAME")
 DOMAIN_NAME=$(etc_cnf "DOMAIN_NAME")
 
 # The valid max 398 days
@@ -111,7 +120,16 @@ SAN_TLS_PATH=$(etc_cnf "SAN_TLS_PATH")
 san_tls_absolute_path=$(pwd)/${SAN_TLS_PATH}
 
 # host_suffix
+ca_host_suffix=${CA_DOMAIN_NAME//\*\./}
 host_suffix=${DOMAIN_NAME//\*\./}
+
+# CA SUBJECT info
+subject_c=$(etc_ca "SUBJECT.C")
+subject_st=$(etc_ca "SUBJECT.ST")
+subject_l=$(etc_ca "SUBJECT.L")
+subject_o=$(etc_ca "SUBJECT.O")
+subject_ou=$(etc_ca "SUBJECT.OU")
+CA_SUBJECT="/C=${subject_c}/ST=${subject_st}/L=${subject_l}/O=${subject_o}/OU=${subject_ou}/CN=${CA_DOMAIN_NAME}/emailAddress=${subject_ou}@${ca_host_suffix}"
 
 # Default SUBJECT info
 subject_c=$(etc_cnf "SUBJECT.C")
@@ -155,28 +173,37 @@ fi
 # Generate ROOT CA
 # Since the issuance of the certificate (no password) :
 # 1.Generate the root certificate key
-openssl genrsa -out ca.key 4096
+if [ ! -f "${ca_host_suffix}.key" ]; then
+    openssl genrsa -out ${ca_host_suffix}.key 4096
+else
+    echo -e "${CYAN_BG_COLOR}----- [ Use present cache CA key file: ${ca_host_suffix}.key ] ----${RES}"
+fi
 # 2.Generate self-signed root certificate
-openssl req -new -x509 \
-    -days ${VALID_DAYS} \
-    -key ca.key \
-    -out ca.crt \
-    -subj "$SUBJECT"
+if [ ! -f "${ca_host_suffix}.crt" ]; then
+echo $CA_SUBJECT
+    openssl req -new -x509 \
+        -days ${VALID_DAYS} \
+        -key ${ca_host_suffix}.key \
+        -out ${ca_host_suffix}.crt \
+        -subj "$CA_SUBJECT"
+else
+    echo -e "${CYAN_BG_COLOR}----- [ Use present cache CA crt file: ${ca_host_suffix}.crt ] ----${RES}"
+fi
 
 # V3 Certificate issuance
 # 1.Generate Certificate Key
-openssl genrsa -out server.key 4096
+openssl genrsa -out ${host_suffix}.key 4096
 
 # 2.CSR generation using SHA256 algorithm to avoid browser weak password error
 openssl req -new \
     -sha256 \
-    -key server.key \
-    -out server.csr \
+    -key ${host_suffix}.key \
+    -out ${host_suffix}.csr \
     -subj "$SUBJECT" \
     -config san.cnf
 
 # 3.Check CSR information
-v3_csr_verify=$(openssl req -text -in server.csr | grep "X509v3 Subject Alternative Name")
+v3_csr_verify=$(openssl req -text -in ${host_suffix}.csr | grep "X509v3 Subject Alternative Name")
 if [[ "$v3_csr_verify" != "" ]] ; then
     echo -e "${GREEN_COLOR}CSR X509v3 is verified.${RES}\n"
 else
@@ -190,17 +217,17 @@ fi
 #           Certificates with the same serial value on the same device will conflict
 openssl x509 -req \
     -days ${VALID_DAYS} \
-    -in server.csr \
-    -CA ca.crt \
-    -CAkey ca.key \
+    -in ${host_suffix}.csr \
+    -CA ${ca_host_suffix}.crt \
+    -CAkey ${ca_host_suffix}.key \
     -set_serial ${SET_SERIAL} \
-    -out server.crt \
+    -out ${host_suffix}.crt \
     -sha256 \
     -extfile san.cnf \
     -extensions v3_req
 
 # 5.Check to see if the CRT certificate is included
-v3_crt_verify=$(openssl x509 -text -in server.crt | grep "X509v3 Subject Alternative Name")
+v3_crt_verify=$(openssl x509 -text -in ${host_suffix}.crt | grep "X509v3 Subject Alternative Name")
 if [[ "$v3_crt_verify" != "" ]] ; then
     echo -e "${GREEN_COLOR}CRT X509v3 is verified.${RES}\n"
 else
@@ -208,24 +235,21 @@ else
     exit
 fi
 
-# Copy & rename & bak & move host_suffix files
-cp server.key ${host_suffix}.key
-cp server.crt ${host_suffix}.crt
-cp ca.crt ${host_suffix}_ca.crt
-mv ${host_suffix}.key ${san_tls_absolute_path}
-mv ${host_suffix}.crt ${san_tls_absolute_path}
-mv ${host_suffix}_ca.crt ${san_tls_absolute_path}
+# Copy & Bak host_suffix files
+cp ${host_suffix}.key ${san_tls_absolute_path}
+cp ${host_suffix}.crt ${san_tls_absolute_path}
+cp ${ca_host_suffix}.crt ${san_tls_absolute_path}
 
 # Move process files to ./dev-tls-process/[date]/
 if [ ! -d "./${SAN_TLS_PATH}-process/${now_date}" ]; then
     mkdir -p "./${SAN_TLS_PATH}-process/${now_date}"
     echo -e "create dir: ./${SAN_TLS_PATH}-process/${now_date}\n"
 fi
-mv ca.key ./${SAN_TLS_PATH}-process/${now_date}/ca.key
-mv ca.crt ./${SAN_TLS_PATH}-process/${now_date}/ca.crt
-mv server.key ./${SAN_TLS_PATH}-process/${now_date}/server.key
-mv server.crt ./${SAN_TLS_PATH}-process/${now_date}/server.crt
-mv server.csr ./${SAN_TLS_PATH}-process/${now_date}/server.csr
+cp ${ca_host_suffix}.key ./${SAN_TLS_PATH}-process/${now_date}/
+cp ${ca_host_suffix}.crt ./${SAN_TLS_PATH}-process/${now_date}/
+mv ${host_suffix}.key ./${SAN_TLS_PATH}-process/${now_date}/
+mv ${host_suffix}.crt ./${SAN_TLS_PATH}-process/${now_date}/
+mv ${host_suffix}.csr ./${SAN_TLS_PATH}-process/${now_date}/
 
 # Convert .crt to .pem
 openssl x509 \
